@@ -167,6 +167,7 @@ HK = snell, 1.2.3.4, 8443, psk = your_psk, version = 5, reuse = true, tfo = true
 | 用 Docker 部署 v6 | [部署 Snell v6](#3-部署-snell-v6) |
 | 做流量限额 | [流量管理](#流量管理) |
 | Alpine 3.19+ 装不上 | [Alpine 版本限制](#alpine-版本限制) |
+| Alpine 重启后连不上 / Docker daemon 未运行 | [在 Alpine 上启用 Docker](#在-alpine-上启用-docker) |
 
 ## 目录
 
@@ -178,6 +179,7 @@ HK = snell, 1.2.3.4, 8443, psk = your_psk, version = 5, reuse = true, tfo = true
     - [一、脚本安装](#一脚本安装)
       - [多版本共存（v4 / v5 / v6 同机运行）](#3-多版本共存v4--v5--v6-同机运行)
       - [Alpine 版本限制](#alpine-版本限制)
+      - [在 Alpine 上启用 Docker](#在-alpine-上启用-docker)
     - [二、Docker 部署](#二docker-部署)
     - [三、Docker Compose](#三docker-compose)
     - [四、查看客户端配置](#四查看客户端配置)
@@ -344,6 +346,30 @@ Snell 官方二进制依赖 glibc，而 Alpine 使用 musl，需要借助
 所以 Alpine 3.19+ 用它也能装上，只是跑在容器里而非直接跑在宿主机上。
 想要纯宿主机安装又必须用 Alpine 的话，只能停留在 3.18。
 
+#### 在 Alpine 上启用 Docker
+
+不走脚本、自己在 Alpine 上装 Docker 再用 `docker run` / `docker compose` 时，
+**docker 服务必须加到 `default` 运行级别**：
+
+```sh
+apk add docker docker-cli-compose
+rc-update add docker default    # 不要加到 boot
+rc-service docker start
+```
+
+Alpine 的 docker 服务声明依赖网络（`need net`），而云厂商 Alpine 镜像的网络服务在 `default` 运行级别。
+docker 放在 `boot` 运行级别时依赖不满足，**重启后 dockerd 不会被拉起**，所有容器离线，
+表现为客户端连不上、`docker compose ps` 报 `Cannot connect to the Docker daemon`。
+已经这样装过的机器执行下面三行即可修复（容器配置了 `restart: unless-stopped` 会自动恢复）：
+
+```sh
+rc-update del docker boot
+rc-update add docker default
+rc-service docker start
+```
+
+`snell-docker.jinqians.com` 脚本（v1.4 起）会自动做这项校正。
+
 Snell 主脚本菜单：
 
 ```
@@ -388,6 +414,9 @@ HK = snell, 1.2.3.4, 7000, psk = yyyyyyyyyyyy, version = 6, mode = default, reus
 | `v6.0.0b1` … `v6.0.0b4` `v6.0.0rc` `v6.0.0rc2` | Snell v6 | 固定版本（预发布） |
 
 架构支持：v4 / v5 为 `amd64`、`arm64`、`armv7`；v6 上游未提供 armv7 构建，仅 `amd64`、`arm64`。
+
+> **Alpine 宿主机**：先按 [在 Alpine 上启用 Docker](#在-alpine-上启用-docker) 把 docker 服务加到 `default` 运行级别，
+> 否则重启后 dockerd 不会启动，容器全部离线。
 
 #### 1. 仅 Snell
 

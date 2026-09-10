@@ -169,6 +169,7 @@ HK = snell, 1.2.3.4, 8443, psk = your_psk, version = 5, reuse = true, tfo = true
 | Deploy v6 with Docker | [Deploying Snell v6](#c-deploying-snell-v6) |
 | Set traffic quotas | [Traffic Management](#traffic-management) |
 | Alpine 3.19+ won't install | [Alpine version limits](#alpine-version-limits) |
+| Alpine unreachable after reboot / Docker daemon not running | [Enabling Docker on Alpine](#enabling-docker-on-alpine) |
 
 ## Table of Contents
 
@@ -295,6 +296,31 @@ When `install.jinqians.com` detects Alpine it **automatically uses the Docker pa
 container instead of directly on the host. If you need a host-level install on Alpine,
 you have to stay on 3.18.
 
+#### Enabling Docker on Alpine
+
+If you install Docker on Alpine yourself and use `docker run` / `docker compose` directly,
+**the docker service must be in the `default` runlevel**:
+
+```sh
+apk add docker docker-cli-compose
+rc-update add docker default    # not boot
+rc-service docker start
+```
+
+Alpine's docker service declares `need net`, and on cloud Alpine images the networking service
+lives in the `default` runlevel. With docker in the `boot` runlevel that dependency is not met,
+so **dockerd does not come back after a reboot** — every container is offline, clients can't
+connect, and `docker compose ps` reports `Cannot connect to the Docker daemon`.
+To fix a machine that was set up this way (containers with `restart: unless-stopped` come back on their own):
+
+```sh
+rc-update del docker boot
+rc-update add docker default
+rc-service docker start
+```
+
+The `snell-docker.jinqians.com` script (v1.4+) applies this fix automatically.
+
 Snell script menu:
 
 ```
@@ -389,6 +415,10 @@ Image: [`jinqians/snell-server`](https://hub.docker.com/r/jinqians/snell-server)
 
 Architectures: v4 / v5 ship `amd64`, `arm64`, `armv7`; v6 has no upstream armv7 build, so
 `amd64` and `arm64` only.
+
+> **Alpine hosts**: first put the docker service in the `default` runlevel as described in
+> [Enabling Docker on Alpine](#enabling-docker-on-alpine), otherwise dockerd won't start after a
+> reboot and every container goes offline.
 
 #### a. Snell only
 
