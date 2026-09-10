@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 RESET='\033[0m'
 
 # --- 脚本版本号 ---
-current_version="1.3"
+current_version="1.4"
 
 # Snell v6 加密模式：default / unshaped / unsafe-raw（客户端必须与服务端一致）
 SNELL_MODE="default"
@@ -74,6 +74,50 @@ check_root() {
     fi
 }
 
+# Alpine 最小安装默认没有 curl，缺失时查公网 IP、拉取版本号都会静默失败
+ensure_curl() {
+    command -v curl >/dev/null 2>&1 && return 0
+    echo -e "${YELLOW}未检测到 curl，正在安装...${RESET}"
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache curl >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl >/dev/null 2>&1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}curl 安装失败，请手动安装后重试。${RESET}"
+        exit 1
+    fi
+}
+
+# 按容器名精确匹配；直接 grep docker ps 的输出会误中镜像名 jinqians/snell-server
+container_exists() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"
+}
+
+container_running() {
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"
+}
+
+# Docker 开机自启
+# Alpine 的 /etc/init.d/docker 声明了 need net，而 net 由 networking 提供，
+# 云镜像里 networking 在 default 运行级别。docker 若放在 boot 运行级别，
+# 开机时依赖不满足、不会被拉起，重启后所有容器都连不上，所以必须放在 default。
+enable_docker_on_boot() {
+    if [ -f /etc/alpine-release ]; then
+        if rc-update show boot 2>/dev/null | grep -qw docker; then
+            rc-update del docker boot >/dev/null 2>&1
+            echo -e "${YELLOW}已将 docker 从 boot 运行级别移到 default（否则重启后不会自动启动）${RESET}"
+        fi
+        rc-update add docker default >/dev/null 2>&1
+    else
+        systemctl enable docker >/dev/null 2>&1
+    fi
+}
+
 check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         echo -e "${YELLOW}未检测到 Docker，是否自动安装？${RESET}"
@@ -87,21 +131,20 @@ check_docker() {
         echo -e "${CYAN}正在安装 Docker...${RESET}"
         if [ -f /etc/alpine-release ]; then
             apk add --no-cache docker docker-cli-compose
-            rc-update add docker boot
-            rc-service docker start
         else
             curl -fsSL https://get.docker.com | sh
-            systemctl enable docker
-            systemctl start docker
         fi
-        
+
         if ! command -v docker >/dev/null 2>&1; then
             echo -e "${RED}Docker 安装失败，请手动安装。${RESET}"
             exit 1
         fi
         echo -e "${GREEN}✓ Docker 安装成功${RESET}"
     fi
-    
+
+    # 每次都校正开机自启，已装过的机器重跑脚本也能修好
+    enable_docker_on_boot
+
     if ! docker info >/dev/null 2>&1; then
         echo -e "${YELLOW}Docker 服务未运行，正在尝试启动...${RESET}"
         if [ -f /etc/alpine-release ]; then
@@ -109,7 +152,12 @@ check_docker() {
         else
             systemctl start docker
         fi
-        sleep 2
+        # dockerd 刚拉起时 socket 还没就绪，最多等 30 秒
+        local i=0
+        while ! docker info >/dev/null 2>&1 && [ "$i" -lt 30 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
         if ! docker info >/dev/null 2>&1; then
             echo -e "${RED}Docker 服务启动失败，请手动启动。${RESET}"
             exit 1
@@ -332,9 +380,20 @@ EOF
     echo -e "${GREEN}✓ Dockerfile 创建完成${RESET}"
 }
 
+# 生成 PSK：不依赖 openssl（Alpine 最小安装默认没有 openssl，
+# 以前 openssl 缺失时 PSK 为空，snell-server 启动即退出）
+generate_psk() {
+    head -c 16 /dev/urandom | base64 | tr -d '\n'
+}
+
 create_config_file() {
-    local psk=$(openssl rand -base64 16)
-    
+    local psk
+    psk=$(generate_psk)
+    if [ -z "$psk" ]; then
+        echo -e "${RED}✗ PSK 生成失败${RESET}"
+        return 1
+    fi
+
     echo -e "${CYAN}创建 Snell 配置文件...${RESET}"
     
     # 创建临时配置目录
@@ -468,10 +527,11 @@ start_snell_container() {
 
 install_snell() {
     check_root
+    ensure_curl
     check_docker
     
     # 检查是否已有容器运行
-    if docker ps -a | grep -q "${CONTAINER_NAME}"; then
+    if container_exists; then
         echo -e "${YELLOW}检测到已存在的 Snell 容器，是否要重新安装？${RESET}"
         printf "输入 y 继续，其他键取消: "
         read -r confirm
@@ -501,8 +561,13 @@ install_snell() {
     echo -e "${CYAN}开始 Docker 方式安装 Snell ${SNELL_VERSION}...${RESET}"
     
     # 创建配置文件
-    create_config_file
-    
+    if ! create_config_file; then
+        echo -e "${RED}安装失败！${RESET}"
+        cd - >/dev/null
+        rm -rf "$WORK_DIR"
+        return 1
+    fi
+
     # 创建 Dockerfile
     create_dockerfile
     
@@ -580,7 +645,7 @@ uninstall_snell() {
 restart_snell() {
     check_root
     
-    if ! docker ps -a | grep -q "${CONTAINER_NAME}"; then
+    if ! container_exists; then
         echo -e "${RED}错误: Snell 容器不存在${RESET}"
         return 1
     fi
@@ -589,7 +654,7 @@ restart_snell() {
     
     if docker restart "${CONTAINER_NAME}"; then
         sleep 2
-        if docker ps | grep -q "${CONTAINER_NAME}"; then
+        if container_running; then
             echo -e "${GREEN}✓ Snell 容器重启成功${RESET}"
         else
             echo -e "${RED}✗ 容器重启后异常${RESET}"
@@ -603,7 +668,7 @@ restart_snell() {
 check_status() {
     echo -e "${CYAN}=== Snell Docker 容器状态 ===${RESET}"
     
-    if docker ps -a | grep -q "${CONTAINER_NAME}"; then
+    if container_exists; then
         echo -e "\n${CYAN}容器信息:${RESET}"
         docker ps -a --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
         
@@ -650,13 +715,13 @@ network_diagnosis() {
     
     # 1. 检查容器状态
     echo -e "${CYAN}1️⃣  检查容器状态...${RESET}"
-    if docker ps | grep -q "${CONTAINER_NAME}"; then
+    if container_running; then
         echo -e "   ${GREEN}✅ 容器正在运行${RESET}"
         local container_ports=$(docker port "${CONTAINER_NAME}")
         echo "   端口映射: $container_ports"
     else
         echo -e "   ${RED}❌ 容器未运行${RESET}"
-        if docker ps -a | grep -q "${CONTAINER_NAME}"; then
+        if container_exists; then
             echo -e "   ${YELLOW}⚠️  容器存在但已停止，尝试启动...${RESET}"
             docker start "${CONTAINER_NAME}"
             sleep 2
@@ -798,7 +863,7 @@ network_diagnosis() {
     
     # 5. 容器内部详细检查
     echo -e "${CYAN}5️⃣  容器内部详细检查...${RESET}"
-    if docker ps | grep -q "${CONTAINER_NAME}"; then
+    if container_running; then
         # 检查容器内部端口
         echo -e "   ${CYAN}检查容器内部端口监听...${RESET}"
         local container_netstat=$(docker exec "${CONTAINER_NAME}" netstat -tln 2>/dev/null | grep ":$port " || echo "")
@@ -1056,7 +1121,7 @@ network_diagnosis() {
                 
                 # 验证修复结果
                 echo -e "   ${CYAN}验证修复结果...${RESET}"
-                if docker ps | grep -q "${CONTAINER_NAME}"; then
+                if container_running; then
                     local new_port_mapping=$(docker port "${CONTAINER_NAME}" 2>/dev/null)
                     if [ -n "$new_port_mapping" ]; then
                         echo -e "   ${GREEN}✅ 端口映射已恢复: $new_port_mapping${RESET}"
@@ -1225,8 +1290,8 @@ show_menu() {
     echo -e "${CYAN}============================================${RESET}"
     
     # 检查容器状态
-    if docker ps -a 2>/dev/null | grep -q "${CONTAINER_NAME}"; then
-        if docker ps 2>/dev/null | grep -q "${CONTAINER_NAME}"; then
+    if container_exists; then
+        if container_running; then
             echo -e "服务状态: ${GREEN}运行中 🟢${RESET}"
         else
             echo -e "服务状态: ${RED}已停止 🔴${RESET}"
