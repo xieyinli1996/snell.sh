@@ -14,11 +14,22 @@ BLUE='\033[0;34m'
 RESET='\033[0m'
 
 # --- 脚本版本号 ---
-current_version="2.1"
+current_version="2.3"
 
 # --- 全局变量 ---
 SNELL_VERSION_CHOICE=""
 SNELL_VERSION=""
+
+# Snell v6 加密模式：default / unshaped / unsafe-raw（客户端必须与服务端一致）
+SNELL_MODE="default"
+
+# Snell v6 DNS 解析地址族偏好：default / prefer-ipv4 / prefer-ipv6 / ipv4-only / ipv6-only
+SNELL_DNS_IP_PREFERENCE="default"
+
+# 抓取失败时的兜底版本号
+SNELL_V4_FALLBACK="v4.1.1"
+SNELL_V5_FALLBACK="v5.0.1"
+SNELL_V6_FALLBACK="v6.0.0rc2"
 SNELL_COMMAND="" # 用于存储最终确认的可执行命令
 
 # --- 定义系统路径 (Alpine) ---
@@ -28,6 +39,40 @@ SNELL_CONF_FILE="${SNELL_CONF_DIR}/users/snell-main.conf"
 OPENRC_SERVICE_FILE="/etc/init.d/snell"
 
 # --- 基础函数 ---
+
+# 查询 IP 所属国家代码（多接口回退，避免单一接口限流返回错误信息）
+get_ip_country() {
+    local target="$1"
+    local api=""
+    local raw=""
+    local result=""
+
+    if [ -z "$target" ]; then
+        echo "Unknown"
+        return 1
+    fi
+
+    for api in "http://ipinfo.io/${target}/country" \
+               "http://ip-api.com/line/${target}?fields=countryCode" \
+               "https://ipwho.is/${target}?fields=country_code" \
+               "https://ipapi.co/${target}/country/"; do
+        raw=$(curl -s --connect-timeout 5 --max-time 10 "$api" 2>/dev/null)
+        result=$(echo "$raw" | tr -d ' \t\r\n')
+        case "$result" in
+            [A-Za-z][A-Za-z]) ;;
+            *) result=$(echo "$raw" | sed -n 's/.*"country_code"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' | head -n 1) ;;
+        esac
+        case "$result" in
+            [A-Za-z][A-Za-z])
+                echo "$result" | tr '[:lower:]' '[:upper:]'
+                return 0
+                ;;
+        esac
+    done
+
+    echo "Unknown"
+    return 1
+}
 
 check_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -136,7 +181,7 @@ select_snell_version() {
     echo -e "${CYAN}请选择要安装的 Snell 版本：${RESET}"
     echo -e "${GREEN}1.${RESET} Snell v4"
     echo -e "${GREEN}2.${RESET} Snell v5"
-    echo -e "${GREEN}3.${RESET} Snell v6 (Beta)"
+    echo -e "${GREEN}3.${RESET} Snell v6 (RC)"
 
     while true; do
         printf "请输入选项 [1-3]: "
@@ -144,33 +189,156 @@ select_snell_version() {
         case "$version_choice" in
             1) SNELL_VERSION_CHOICE="v4"; echo -e "${GREEN}已选择 Snell v4${RESET}"; break ;;
             2) SNELL_VERSION_CHOICE="v5"; echo -e "${GREEN}已选择 Snell v5${RESET}"; break ;;
-            3) SNELL_VERSION_CHOICE="v6"; echo -e "${GREEN}已选择 Snell v6 (Beta)${RESET}"; echo -e "${YELLOW}注意：v6 为 Beta 版本，协议可能存在不兼容更新${RESET}"; break ;;
+            3) SNELL_VERSION_CHOICE="v6"; echo -e "${GREEN}已选择 Snell v6 (RC)${RESET}"; echo -e "${YELLOW}注意：v6 仍为预发布版本，协议可能存在不兼容更新${RESET}"; echo -e "${YELLOW}v6 已移除 QUIC 代理模式与 obfs，且不提供 armv7l 构建${RESET}"; echo -e "${YELLOW}加密模式：mode = ${SNELL_MODE}（客户端需配置相同的 mode）${RESET}"; break ;;
             *) echo -e "${RED}请输入正确的选项 [1-3]${RESET}" ;;
         esac
     done
 }
 
+# === Snell v6 参数选择（POSIX sh 写法）===
+# 加密模式 (mode)：客户端必须配置完全相同的值，否则无法连接
+select_snell_v6_mode() {
+    echo -e "\n${CYAN}=== Snell v6 加密模式 (mode) ===${RESET}"
+    echo -e "${YELLOW}客户端必须配置与服务端完全相同的 mode，不一致将无法连接${RESET}\n"
+    echo -e "${GREEN}1.${RESET} default     流量混淆 + AES 加密"
+    echo -e "   特征伪装最完整，抗识别与抗封锁能力最强"
+    echo -e "   ${CYAN}建议：绝大多数用户、线路存在干扰或 QoS 时选此项${RESET}"
+    echo -e "${GREEN}2.${RESET} unshaped    关闭混淆，仅 AES 加密"
+    echo -e "   吞吐相比 default 提升约 10%，但流量特征更明显"
+    echo -e "   ${CYAN}建议：线路干净、以速度为先，或已叠加 ShadowTLS 等外层伪装时选此项${RESET}"
+    echo -e "${GREEN}3.${RESET} unsafe-raw  明文转发，不加密不混淆"
+    echo -e "   ${RED}数据可被完整还原，公网环境切勿使用${RESET}"
+    echo -e "   ${CYAN}建议：仅用于内网或完全可信链路的性能测试${RESET}\n"
+
+    while true; do
+        printf "请选择加密模式 [1-3]（回车使用 1）: "
+        read -r mode_choice
+        [ -z "$mode_choice" ] && mode_choice="1"
+        case "$mode_choice" in
+            1) SNELL_MODE="default";  break ;;
+            2) SNELL_MODE="unshaped"; break ;;
+            3)
+                SNELL_MODE="unsafe-raw"
+                echo -e "${RED}警告：unsafe-raw 为明文传输，请确认该链路完全可信！${RESET}"
+                printf "确认使用 unsafe-raw? [y/N]: "
+                read -r raw_confirm
+                case "$raw_confirm" in
+                    [yY]|[yY][eE][sS]) break ;;
+                    *) echo -e "${CYAN}已取消，请重新选择${RESET}" ;;
+                esac
+                ;;
+            *) echo -e "${RED}请输入正确的选项 [1-3]${RESET}" ;;
+        esac
+    done
+    echo -e "${GREEN}已选择 mode = ${SNELL_MODE}${RESET}"
+}
+
+# DNS 解析地址族偏好 (dns-ip-preference)：影响服务端解析目标域名后用哪种地址出站
+select_snell_v6_dns_preference() {
+    echo -e "\n${CYAN}=== Snell v6 DNS 解析偏好 (dns-ip-preference) ===${RESET}"
+    echo -e "${YELLOW}控制服务端解析目标域名后优先使用哪种地址族出站，与监听地址无关${RESET}\n"
+    echo -e "${GREEN}1.${RESET} default       跟随系统默认解析行为"
+    echo -e "   ${CYAN}建议：不确定时选此项，适配绝大多数 VPS${RESET}"
+    echo -e "${GREEN}2.${RESET} prefer-ipv4   双栈可用时优先 IPv4，失败再试 IPv6"
+    echo -e "   ${CYAN}建议：IPv6 出口质量差、或目标站点 IPv6 解锁较差时${RESET}"
+    echo -e "${GREEN}3.${RESET} prefer-ipv6   双栈可用时优先 IPv6，失败再试 IPv4"
+    echo -e "   ${CYAN}建议：IPv6 线路更优，或需要 IPv6 解锁流媒体时${RESET}"
+    echo -e "${GREEN}4.${RESET} ipv4-only     只使用 IPv4 解析结果"
+    echo -e "   ${CYAN}建议：VPS 无 IPv6 出口，避免连接 IPv6 目标时超时等待${RESET}"
+    echo -e "${GREEN}5.${RESET} ipv6-only     只使用 IPv6 解析结果"
+    echo -e "   ${CYAN}建议：IPv6 Only 的 VPS（无 IPv4 出口）${RESET}\n"
+
+    while true; do
+        printf "请选择 DNS 解析偏好 [1-5]（回车使用 1）: "
+        read -r dns_pref_choice
+        [ -z "$dns_pref_choice" ] && dns_pref_choice="1"
+        case "$dns_pref_choice" in
+            1) SNELL_DNS_IP_PREFERENCE="default";     break ;;
+            2) SNELL_DNS_IP_PREFERENCE="prefer-ipv4"; break ;;
+            3) SNELL_DNS_IP_PREFERENCE="prefer-ipv6"; break ;;
+            4) SNELL_DNS_IP_PREFERENCE="ipv4-only";   break ;;
+            5) SNELL_DNS_IP_PREFERENCE="ipv6-only";   break ;;
+            *) echo -e "${RED}请输入正确的选项 [1-5]${RESET}" ;;
+        esac
+    done
+    echo -e "${GREEN}已选择 dns-ip-preference = ${SNELL_DNS_IP_PREFERENCE}${RESET}"
+}
+
+# 统一入口：安装 v6 时调用
+configure_snell_v6_options() {
+    select_snell_v6_mode
+    select_snell_v6_dns_preference
+    echo -e "\n${CYAN}=== v6 参数确认 ===${RESET}"
+    echo -e "${GREEN}服务端 mode              : ${SNELL_MODE}${RESET}"
+    echo -e "${GREEN}服务端 dns-ip-preference : ${SNELL_DNS_IP_PREFERENCE}${RESET}"
+    echo -e "${YELLOW}客户端对应配置：version = 6, mode = ${SNELL_MODE}${RESET}"
+}
+
+# Snell 官方发布页（旧的 manual.nssurge.com/others/snell.html 已下线）
+SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
+SNELL_RELEASE_NOTES_URL_ZH="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell"
+
+# 抓取官方发布页内容
+fetch_snell_release_notes() {
+    notes=$(curl -s --max-time 15 "$SNELL_RELEASE_NOTES_URL")
+    if [ -z "$notes" ]; then
+        notes=$(curl -s --max-time 15 "$SNELL_RELEASE_NOTES_URL_ZH")
+    fi
+    echo "$notes"
+}
+
+# 把版本号转成定长可排序键，排序优先级：beta < rc < 正式版
+snell_version_sort_key() {
+    echo "${1#v}" | awk '{
+        ver = $0
+        suffix = ""
+        if (match(ver, /[a-zA-Z]+[0-9]*$/)) {
+            suffix = tolower(substr(ver, RSTART))
+            ver = substr(ver, 1, RSTART - 1)
+        }
+        split(ver, part, ".")
+        stage = 3
+        seq = 0
+        if (suffix != "") {
+            stage = (suffix ~ /^rc/) ? 2 : 1
+            digits = suffix
+            gsub(/[^0-9]/, "", digits)
+            if (digits != "") seq = digits + 0
+        }
+        printf "%03d.%03d.%03d.%d.%04d", part[1], part[2], part[3], stage, seq
+    }'
+}
+
+# 从发布页中挑出指定大版本的最新版本（页面上的先后顺序不代表新旧，必须排序）
+pick_latest_snell_version() {
+    major="$1"
+    notes="$2"
+
+    echo "$notes" \
+        | grep -oE "snell-server-v${major}\.[0-9]+\.[0-9]+[a-zA-Z0-9]*" \
+        | sed 's/^snell-server-v//' \
+        | sort -u \
+        | while read -r ver; do
+              echo "$(snell_version_sort_key "$ver") ${ver}"
+          done \
+        | sort \
+        | tail -n 1 \
+        | awk '{print $2}'
+}
+
 get_latest_snell_v4_version() {
-    latest_version=$(curl -s https://manual.nssurge.com/others/snell.html | grep -o 'snell-server-v4\.[0-9]\+\.[0-9]\+' | head -n 1 | sed 's/snell-server-v//')
-    if [ -n "$latest_version" ]; then echo "v${latest_version}"; else echo "v4.0.1"; fi
+    ver=$(pick_latest_snell_version 4 "$(fetch_snell_release_notes)")
+    if [ -n "$ver" ]; then echo "v${ver}"; else echo "${SNELL_V4_FALLBACK}"; fi
 }
 
 get_latest_snell_v5_version() {
-    v5_beta=$(curl -s https://manual.nssurge.com/others/snell.html | grep -o 'snell-server-v5\.[0-9]\+\.[0-9]\+b[0-9]\+' | head -n 1 | sed 's/snell-server-v//')
-    if [ -z "$v5_beta" ]; then
-        v5_beta=$(curl -s https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell | grep -o 'snell-server-v5\.[0-9]\+\.[0-9]\+b[0-9]\+' | head -n 1 | sed 's/snell-server-v//')
-    fi
-    if [ -n "$v5_beta" ]; then echo "v${v5_beta}"; return; fi
-    v5_release=$(curl -s https://manual.nssurge.com/others/snell.html | grep -o 'snell-server-v5\.[0-9]\+\.[0-9]\+[a-z0-9]*' | grep -v b | head -n 1 | sed 's/snell-server-v//')
-    if [ -z "$v5_release" ]; then
-        v5_release=$(curl -s https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell | grep -o 'snell-server-v5\.[0-9]\+\.[0-9]\+[a-z0-9]*' | grep -v b | head -n 1 | sed 's/snell-server-v//')
-    fi
-    if [ -n "$v5_release" ]; then echo "v${v5_release}"; else echo "v5.0.1"; fi
+    ver=$(pick_latest_snell_version 5 "$(fetch_snell_release_notes)")
+    if [ -n "$ver" ]; then echo "v${ver}"; else echo "${SNELL_V5_FALLBACK}"; fi
 }
 
 get_latest_snell_v6_version() {
-    v6_ver=$(curl -s https://kb.nssurge.com/surge-knowledge-base/release-notes/snell | grep -o 'snell-server-v6\.[0-9]\+\.[0-9]\+[a-z0-9]*' | head -n 1 | sed 's/snell-server-v//')
-    if [ -n "$v6_ver" ]; then echo "v${v6_ver}"; else echo "v6.0.0b4"; fi
+    ver=$(pick_latest_snell_version 6 "$(fetch_snell_release_notes)")
+    if [ -n "$ver" ]; then echo "v${ver}"; else echo "${SNELL_V6_FALLBACK}"; fi
 }
 
 get_latest_snell_version() {
@@ -389,16 +557,26 @@ EOF
     mkdir -p "${SNELL_CONF_DIR}/users"
     mkdir -p "/var/log/snell"
     get_user_port
+    # v6 需要额外选择 mode 与 dns-ip-preference
+    if [ "$SNELL_VERSION_CHOICE" = "v6" ]; then
+        configure_snell_v6_options
+    fi
     PSK=$(openssl rand -base64 16)
 
-    cat > ${SNELL_CONF_FILE} << EOF
-[snell-server]
-listen = 0.0.0.0:${PORT}
-psk = ${PSK}
-ipv6 = true
-tfo = true
-version-choice = ${SNELL_VERSION_CHOICE}
-EOF
+    # v6 使用 mode / dns-ip-preference，ipv6 参数在 v6 已废弃
+    {
+        echo "[snell-server]"
+        echo "listen = 0.0.0.0:${PORT}"
+        echo "psk = ${PSK}"
+        if [ "$SNELL_VERSION_CHOICE" = "v6" ]; then
+            echo "mode = ${SNELL_MODE}"
+            echo "dns-ip-preference = ${SNELL_DNS_IP_PREFERENCE}"
+        else
+            echo "ipv6 = true"
+            echo "tfo = true"
+        fi
+        echo "version-choice = ${SNELL_VERSION_CHOICE}"
+    } > ${SNELL_CONF_FILE}
 
     # 修正：使用您脚本中更健壮的 OpenRC 服务文件
     cat > ${OPENRC_SERVICE_FILE} << EOF
@@ -487,6 +665,8 @@ show_information() {
     PSK=$(grep 'psk' ${SNELL_CONF_FILE} | sed 's/^[^=]*=[[:space:]]*//')
     INSTALLED_VERSION_CHOICE=$(grep 'version-choice' ${SNELL_CONF_FILE} | sed 's/version-choice\s*=\s*//')
     [ -z "$INSTALLED_VERSION_CHOICE" ] && INSTALLED_VERSION_CHOICE="v4"
+    INSTALLED_MODE=$(grep -E '^[[:space:]]*mode[[:space:]]*=' ${SNELL_CONF_FILE} | head -n 1 | sed 's/^[^=]*=[[:space:]]*//')
+    [ -z "$INSTALLED_MODE" ] && INSTALLED_MODE="${SNELL_MODE}"
     
     IPV4_ADDR=$(curl -s4 --connect-timeout 5 https://api.ipify.org)
     IPV6_ADDR=$(curl -s6 --connect-timeout 5 https://api64.ipify.org)
@@ -497,10 +677,10 @@ show_information() {
     echo -e "${BLUE}============================================${RESET}"
 
     if [ -n "$IPV4_ADDR" ]; then
-        IP_COUNTRY_IPV4=$(curl -s --connect-timeout 5 "http://ipinfo.io/${IPV4_ADDR}/country" 2>/dev/null)
+        IP_COUNTRY_IPV4=$(get_ip_country "${IPV4_ADDR}")
         echo -e "${GREEN}--- IPv4 Surge 配置 (Snell ${INSTALLED_VERSION_CHOICE}) ---${RESET}"
         if [ "$INSTALLED_VERSION_CHOICE" = "v6" ]; then
-            echo -e "${GREEN}${IP_COUNTRY_IPV4} = snell, ${IPV4_ADDR}, ${PORT}, psk=${PSK}, version=6, reuse=true, tfo=true${RESET}"
+            echo -e "${GREEN}${IP_COUNTRY_IPV4} = snell, ${IPV4_ADDR}, ${PORT}, psk=${PSK}, version=6, mode=${INSTALLED_MODE}, reuse=true, tfo=true${RESET}"
         elif [ "$INSTALLED_VERSION_CHOICE" = "v5" ]; then
             echo -e "${GREEN}${IP_COUNTRY_IPV4}_v4 = snell, ${IPV4_ADDR}, ${PORT}, psk=${PSK}, version=4, reuse=true, tfo=true${RESET}"
             echo -e "${GREEN}${IP_COUNTRY_IPV4}_v5 = snell, ${IPV4_ADDR}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=true${RESET}"
@@ -510,10 +690,10 @@ show_information() {
     fi
 
     if [ -n "$IPV6_ADDR" ]; then
-        IP_COUNTRY_IPV6=$(curl -s --connect-timeout 5 "https://ipapi.co/${IPV6_ADDR}/country/" 2>/dev/null)
+        IP_COUNTRY_IPV6=$(get_ip_country "${IPV6_ADDR}")
         echo -e "\n${GREEN}--- IPv6 Surge 配置 (Snell ${INSTALLED_VERSION_CHOICE}) ---${RESET}"
         if [ "$INSTALLED_VERSION_CHOICE" = "v6" ]; then
-            echo -e "${GREEN}${IP_COUNTRY_IPV6} = snell, ${IPV6_ADDR}, ${PORT}, psk=${PSK}, version=6, reuse=true, tfo=true${RESET}"
+            echo -e "${GREEN}${IP_COUNTRY_IPV6} = snell, ${IPV6_ADDR}, ${PORT}, psk=${PSK}, version=6, mode=${INSTALLED_MODE}, reuse=true, tfo=true${RESET}"
         elif [ "$INSTALLED_VERSION_CHOICE" = "v5" ]; then
             echo -e "${GREEN}${IP_COUNTRY_IPV6}_v4 = snell, ${IPV6_ADDR}, ${PORT}, psk=${PSK}, version=4, reuse=true, tfo=true${RESET}"
             echo -e "${GREEN}${IP_COUNTRY_IPV6}_v5 = snell, ${IPV6_ADDR}, ${PORT}, psk=${PSK}, version=5, reuse=true, tfo=true${RESET}"
